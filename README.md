@@ -56,28 +56,28 @@ I chose **Option C — Internal Knowledge Assistant** because it exercises the b
 ## Architecture
 
 ```
-┌──────────────┐     ┌─────────────────────────────────────────┐
-│   Client     │────▶│  FastAPI (API Layer)                    │
-│  (curl/app)  │     │  ┌──────────┐  ┌──────────────────────┐│
-└──────────────┘     │  │  Routes   │  │  Dependencies        ││
-                     │  │  /ask     │  │  (tenant validation) ││
-                     │  │  /docs    │  └──────────────────────┘│
-                     │  └────┬─────┘                           │
+┌──────────────┐     ┌──────────────────────────────────────────┐
+│   Client     │────▶│           FastAPI (API Layer)            │
+│  (curl/app)  │     │  ┌──────────┐  ┌──────────────────────┐  │
+└──────────────┘     │  │  Routes  │  │  Dependencies        │  │
+                     │  │  /ask    │  │  (tenant validation) │  │
+                     │  │  /docs   │  └──────────────────────┘  │
+                     │  └────┬─────┘                            │
                      │       │                                  │
                      │  ┌────▼─────────────────────────────────┐│
-                     │  │  Service Layer                        ││
+                     │  │           Service Layer              ││
                      │  │  ┌────────────┐  ┌────────────────┐  ││
                      │  │  │ Query Svc  │  │ Document Svc   │  ││
                      │  │  │ (RAG pipe) │  │ (ingest+chunk) │  ││
                      │  │  └─────┬──────┘  └───────┬────────┘  ││
-                     │  │        │                  │           ││
+                     │  │        │                 │           ││
                      │  │  ┌─────▼──────┐  ┌───────▼────────┐  ││
                      │  │  │ LLM Svc    │  │ Embedding Svc  │  ││
                      │  │  │(stub/openai)│ │(stub/openai)   │  ││
                      │  │  └────────────┘  └────────────────┘  ││
-                     │  │        │                  │           ││
+                     │  │        │                  │          ││
                      │  │  ┌─────▼──────────────────▼────────┐ ││
-                     │  │  │       Cache Service (Redis)      │ ││
+                     │  │  │       Cache Service (Redis)     │ ││
                      │  │  └─────────────────────────────────┘ ││
                      │  └──────────────────────────────────────┘│
                      └──────────────────────────────────────────┘
@@ -119,7 +119,7 @@ I chose **Option C — Internal Knowledge Assistant** because it exercises the b
 ### A1. Problem Framing
 
 **Who is the user?**
-Non-technical employees (HR, operations, marketing, support) who need quick answers to internal questions — "How many vacation days do I get?", "What's the password policy?", "How do I submit expenses?"
+Non-technical employees (HR, operations, marketing, support, recepptionists at the clinics) who need quick answers to internal questions — "How many vacation days do I get?", "What's the password policy?", "How do I submit expenses?", "What are the botox promotions available this month?", etc.
 
 **What decision are they trying to make?**
 They need to understand company policies, processes, and guidelines to make day-to-day operational decisions without waiting for HR/IT responses.
