@@ -17,6 +17,7 @@ A multi-tenant, RAG-powered internal knowledge assistant that answers employee q
 - [Section C — Cost Control Strategy](#section-c--cost-control-strategy)
 - [Section D — Tenant Isolation Strategy](#section-d--tenant-isolation-strategy)
 - [Section E — Execution Reality Check](#section-e--execution-reality-check)
+- [Remark: Document Versioning Strategy](#remark-document-versioning-strategy--handling-multiple-versions-of-truth)
 - [Runbook](#runbook)
 - [What I Would Improve With More Time](#what-i-would-improve-with-more-time)
 
@@ -355,6 +356,147 @@ LIMIT 5
 
 ---
 
+## Remark: Document Versioning Strategy - Handling Multiple Versions of Truth
+
+A critical real-world challenge for any knowledge assistant is **document versioning**: when a policy updates (e.g., annual leave changes from 20 to 25 days), the system must serve the *current* version and never return stale or conflicting information. This section describes the current safeguards and the planned v2 evolution.
+
+### The Problem
+
+Consider this scenario:
+1. "Employee Leave Policy v1" is ingested — says 20 days annual leave.
+2. Months later, the policy is updated to 25 days and re-ingested as "Employee Leave Policy v2".
+3. Both versions now have chunks in the vector store.
+4. An employee asks "How many days of annual leave do I get?" — retrieval returns chunks from **both versions**, and the LLM sees conflicting numbers.
+
+This is not a hypothetical edge case — it is the **most common source of wrong answers** in production RAG systems.
+
+### Current Safeguards (v1)
+
+The current architecture already provides partial protection:
+
+1. **Delete-and-replace workflow** — The `DELETE /api/v1/documents/{id}` endpoint cascades to `document_chunks`, removing all old chunks before the updated document is re-ingested. This is the recommended workflow:
+   ```bash
+   # 1. Delete the old version
+   curl -X DELETE http://localhost:8000/api/v1/documents/{old_doc_id} \
+     -H "X-Tenant-Id: ..."
+
+   # 2. Ingest the new version
+   curl -X POST http://localhost:8000/api/v1/documents \
+     -H "X-Tenant-Id: ..." \
+     -d '{"title": "Employee Leave Policy", "content": "..."}'
+   ```
+
+2. **Cache invalidation** — When documents are ingested or deleted, all cached query results for that tenant are purged from Redis. This prevents stale cached answers from being served after a policy update.
+
+3. **Source citation** — Every answer includes the document title and chunk excerpt in the `sources` field, making it auditable which version informed the answer.
+
+### Planned v2 — Explicit Version Control
+
+The v2 data model introduces first-class version tracking:
+
+```sql
+-- Extended documents table
+documents
+├── id (UUID PK)
+├── tenant_id (FK)
+├── title
+├── content
+├── version          -- INTEGER, auto-incremented per title+tenant
+├── status           -- 'active' | 'superseded' | 'archived'
+├── supersedes_id    -- FK → documents (previous version)
+├── effective_date   -- TIMESTAMPTZ (when this version takes effect)
+├── expiry_date      -- TIMESTAMPTZ (optional, for time-bound policies)
+├── metadata (JSONB) -- includes change_summary, author, approval_status
+└── created_at, updated_at
+
+-- Extended chunks table
+document_chunks
+├── ...existing fields...
+├── doc_version      -- INTEGER, copied from documents.version
+├── doc_status       -- 'active' | 'superseded', denormalized for filtering
+└── ...
+```
+
+#### How Retrieval Avoids Version Conflicts
+
+**Strategy: "Only retrieve from active documents"**
+
+The vector search query adds a hard filter on document status:
+
+```sql
+SELECT dc.id, dc.content, d.title, d.version,
+       1 - (dc.embedding <=> :query_vec) AS similarity
+FROM document_chunks dc
+JOIN documents d ON d.id = dc.document_id
+WHERE dc.tenant_id = :tenant_id
+  AND dc.doc_status = 'active'              -- ONLY current versions
+  AND 1 - (dc.embedding <=> :query_vec) > :threshold
+ORDER BY dc.embedding <=> :query_vec
+LIMIT :top_k
+```
+
+This guarantees the LLM context window **never contains superseded content**, eliminating version conflicts entirely at the retrieval layer.
+
+#### Version Lifecycle
+
+```
+┌──────────┐     Ingest new version      ┌──────────┐
+│  active  │ ─────────────────────────▶  │  active  │  (new version)
+│  v1      │                             │  v2      │
+└────┬─────┘                             └──────────┘
+     │
+     ▼  (automatic)
+┌──────────┐
+│superseded│  ← v1 chunks excluded from retrieval
+│  v1      │
+└────┬─────┘
+     │  (manual or TTL-based)
+     ▼
+┌──────────┐
+│ archived │  ← optionally purged from vector store
+│  v1      │
+└──────────┘
+```
+
+**Transition rules:**
+1. When a new version of a document is ingested (matched by title + tenant), the previous version's status is set to `superseded` automatically.
+2. Superseded documents remain in PostgreSQL for audit/history but their chunks are excluded from vector search via the `doc_status = 'active'` filter.
+3. Archived documents can have their embeddings deleted to reclaim vector index space, while retaining the text in PostgreSQL for compliance.
+
+#### Effective Date Support
+
+For policies with a future effective date (e.g., "new leave policy effective March 1st"):
+
+```sql
+WHERE dc.doc_status = 'active'
+  AND d.effective_date <= NOW()                    -- only currently-effective docs
+  AND (d.expiry_date IS NULL OR d.expiry_date > NOW())  -- not expired
+```
+
+This enables **scheduling policy updates in advance** — ingest the new version with a future `effective_date`, and it automatically becomes the active version on that date without manual intervention.
+
+#### Additional Best Practices
+
+| Practice | Purpose |
+|---|---|
+| **Immutable chunks** | Never update a chunk in-place; always create new chunks and mark old ones superseded. This preserves audit trail integrity. |
+| **Change summary in metadata** | Store a `change_summary` field (e.g., "Annual leave increased from 20 to 25 days") so admins can review what changed between versions. |
+| **Embedding model versioning** | Track the embedding model name + version in chunk metadata. When the model changes, only re-embed active documents (skip archived ones). |
+| **Conflict detection at query time** | If retrieval returns chunks from multiple versions of the same document (shouldn't happen with `doc_status` filter, but as defense-in-depth), deduplicate by keeping only the highest-version chunks. |
+| **Webhook on version change** | Notify downstream systems (Slack, email) when a document is superseded, so teams are aware of policy updates. |
+| **Diff-based re-embedding** | Only re-embed chunks whose text actually changed between versions, reducing embedding API costs on large documents with minor edits. |
+
+#### Why Not Use the LLM to Resolve Conflicts?
+
+A tempting approach is to send both versions to the LLM and let it pick the "most recent." This is **dangerous** because:
+
+1. LLMs cannot reliably reason about temporal ordering without explicit metadata.
+2. It doubles context token usage (sending old + new versions).
+3. The model may "blend" information from both versions, producing subtly wrong answers.
+4. **Correct approach**: resolve conflicts at the **data layer** (filtering), not the **inference layer** (prompting).
+
+---
+
 ## Runbook
 
 ### Prerequisites
@@ -463,7 +605,7 @@ Interactive API docs available at: [http://localhost:8000/docs](http://localhost
 1. **JWT/OAuth authentication** — replace the `X-Tenant-Id` header with proper token-based auth.
 2. **Streaming responses** — SSE stream from the LLM for better UX on longer answers.
 3. **Conversation context** — multi-turn conversations with session tracking.
-4. **Document versioning** — track changes over time, diff-based re-embedding.
+4. **Document versioning (v2 data model)** — implement the full version lifecycle described in [Document Versioning Strategy](#document-versioning-strategy--handling-multiple-versions-of-truth) with `status`, `supersedes_id`, `effective_date`, and automatic supersession on re-ingestion. Add diff-based re-embedding to minimize cost on minor edits.
 5. **Hybrid search** — combine vector similarity with BM25 keyword search for better retrieval.
 6. **Evaluation pipeline** — automated tests comparing LLM outputs against golden answers.
 7. **Observability** — OpenTelemetry tracing, Prometheus metrics, Grafana dashboards.
